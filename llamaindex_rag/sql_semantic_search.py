@@ -26,7 +26,15 @@ DB_PATH = BASE_DIR / "data" / "telecom_ops.db"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# How many tables the retriever picks for each question
+TOP_K_TABLES = 2
 
+# Maximum length of the LLM's answer
+LLM_MAX_TOKENS = 1000
+
+
+# Plain-language description of each table. The retriever compares the
+# user's question to these descriptions to decide which tables to query.
 TABLE_DESCRIPTIONS = {
     "network_towers": (
         "Current tower inventory. Contains tower_id, tower_name, geographic "
@@ -91,38 +99,37 @@ TABLE_DESCRIPTIONS = {
 }
 
 
+# Holds the query engine after the first request so the embedding model
+# and table index are not rebuilt for every question.
+_query_engine = None
+
+
 def configure_models():
+    """Loads the API key and sets the embedding model and LLM."""
     load_dotenv(BASE_DIR / ".env")
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     model_name = os.getenv("ANTHROPIC_MODEL")
 
     if not api_key:
-        raise ValueError(
-            "ANTHROPIC_API_KEY was not found in .env"
-        )
+        raise ValueError("ANTHROPIC_API_KEY was not found in .env")
 
     if not model_name:
-        raise ValueError(
-            "ANTHROPIC_MODEL was not found in .env"
-        )
+        raise ValueError("ANTHROPIC_MODEL was not found in .env")
 
-    Settings.embed_model = HuggingFaceEmbedding(
-        model_name=EMBEDDING_MODEL
-    )
+    Settings.embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL)
 
     Settings.llm = Anthropic(
         model=model_name,
         api_key=api_key,
-        max_tokens=1000,
+        max_tokens=LLM_MAX_TOKENS,
     )
 
 
 def create_sql_database():
+    """Connects to the SQLite database and wraps the allowed tables."""
     if not DB_PATH.exists():
-        raise FileNotFoundError(
-            f"SQLite database not found: {DB_PATH}"
-        )
+        raise FileNotFoundError(f"SQLite database not found: {DB_PATH}")
 
     database_url = f"sqlite:///{DB_PATH.as_posix()}"
 
@@ -137,9 +144,8 @@ def create_sql_database():
 
 
 def create_table_retriever(sql_database):
-    table_node_mapping = SQLTableNodeMapping(
-        sql_database
-    )
+    """Builds a retriever that picks the most relevant tables for a question."""
+    table_node_mapping = SQLTableNodeMapping(sql_database)
 
     table_schema_objects = []
 
@@ -157,34 +163,45 @@ def create_table_retriever(sql_database):
         VectorStoreIndex,
     )
 
-    return object_index.as_retriever(
-        similarity_top_k=2
-    )
+    return object_index.as_retriever(similarity_top_k=TOP_K_TABLES)
 
 
 def create_sql_query_engine():
+    """Creates the text-to-SQL query engine."""
     configure_models()
 
     _, sql_database = create_sql_database()
 
-    table_retriever = create_table_retriever(
-        sql_database
-    )
+    table_retriever = create_table_retriever(sql_database)
 
-    query_engine = SQLTableRetrieverQueryEngine(
+    return SQLTableRetrieverQueryEngine(
         sql_database=sql_database,
         table_retriever=table_retriever,
     )
 
-    return query_engine
+
+def get_query_engine():
+    """Returns the shared query engine, creating it on first use."""
+    global _query_engine
+
+    if _query_engine is None:
+        _query_engine = create_sql_query_engine()
+
+    return _query_engine
 
 
 def ask_network_analytics(question):
-    query_engine = create_sql_query_engine()
-    response = query_engine.query(question)
+    """Answers a network analytics question using the database."""
+    response = get_query_engine().query(question)
     return str(response)
 
+
+# ---------------------------------------------------------------
+# Validation helpers (run directly against the database)
+# ---------------------------------------------------------------
+
 def test_latest_packet_loss(engine):
+    """Lists the five towers with the highest latest packet loss."""
     sql = """
     WITH latest_samples AS (
         SELECT
@@ -203,7 +220,7 @@ def test_latest_packet_loss(engine):
     FROM tower_performance AS p
     JOIN latest_samples AS latest
         ON p.tower_id = latest.tower_id
-       AND p.recorded_at = latest.latest_recorded_at
+        AND p.recorded_at = latest.latest_recorded_at
     JOIN network_towers AS t
         ON p.tower_id = t.tower_id
     ORDER BY p.packet_loss_pct DESC
@@ -230,6 +247,7 @@ def test_latest_packet_loss(engine):
 
 
 def test_critical_outages_by_region(engine):
+    """Counts CRITICAL outages per region."""
     sql = """
     SELECT
         region,
@@ -253,16 +271,14 @@ def test_critical_outages_by_region(engine):
         for row in result:
             print(
                 f"{row.region:10} | "
-                f"Critical outages: "
-                f"{row.critical_outage_count:2} | "
-                f"Affected customers: "
-                f"{row.total_affected_customers:6} | "
-                f"Duration: "
-                f"{row.total_duration_hours:.2f} hours"
+                f"Critical outages: {row.critical_outage_count:2} | "
+                f"Affected customers: {row.total_affected_customers:6} | "
+                f"Duration: {row.total_duration_hours:.2f} hours"
             )
 
 
 def test_semantic_table_selection(table_retriever):
+    """Prints which tables the retriever picks for sample questions."""
     test_queries = [
         "Which towers have the highest packet loss right now?",
         "Which region had the most CRITICAL outages?",
@@ -279,34 +295,31 @@ def test_semantic_table_selection(table_retriever):
     for query in test_queries:
         print(f"\nQuestion: {query}")
 
-        retrieved_tables = table_retriever.retrieve(
-            query
-        )
+        retrieved_tables = table_retriever.retrieve(query)
 
         print("Selected tables:")
 
         for table in retrieved_tables:
-            print(
-                f"  - {table.table_name}"
-            )
+            print(f"  - {table.table_name}")
 
 
 def main():
+    """Command-line mode: ask questions until the user types 'exit'."""
     print("NETWORK ANALYTICS - LLAMAINDEX SEMANTIC SQL")
     print("=" * 80)
+    print("Type 'exit' to quit.")
 
-    question = input(
-        "\nEnter network analytics question: "
-    )
+    while True:
+        question = input("\nEnter network analytics question: ").strip()
 
-    answer = ask_network_analytics(
-        question
-    )
+        if question.lower() in {"exit", "quit", ""}:
+            break
 
-    print("\nANSWER")
-    print("-" * 80)
+        answer = ask_network_analytics(question)
 
-    print(answer)
+        print("\nANSWER")
+        print("-" * 80)
+        print(answer)
 
 
 if __name__ == "__main__":

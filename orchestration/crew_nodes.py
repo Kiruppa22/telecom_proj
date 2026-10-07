@@ -10,91 +10,76 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
 
-ANTHROPIC_API_KEY = os.getenv(
-    "ANTHROPIC_API_KEY"
-)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 ANTHROPIC_MODEL = os.getenv(
     "ANTHROPIC_MODEL",
     "claude-haiku-4-5-20251001",
 )
 
+# Low temperature keeps replies factual and consistent
+CREW_TEMPERATURE = 0.1
+
 
 if not ANTHROPIC_API_KEY:
-    raise ValueError(
-        "ANTHROPIC_API_KEY was not found in .env"
-    )
+    raise ValueError("ANTHROPIC_API_KEY was not found in .env")
 
 
+# Shared language model used by both crew agents
 llm = LLM(
     model=f"anthropic/{ANTHROPIC_MODEL}",
     api_key=ANTHROPIC_API_KEY,
-    temperature=0.1,
+    temperature=CREW_TEMPERATURE,
 )
 
 
+# Agent 1: writes the first draft of the customer reply
 communications_specialist = Agent(
     role="Customer Communications Specialist",
-
     goal=(
-        "Transform verified telecom operations findings "
-        "into a clear, accurate, professional, and "
-        "customer-ready response without inventing facts."
+        "Turn verified telecom operations findings into a clear, "
+        "accurate, professional, customer-ready reply without "
+        "inventing any facts."
     ),
-
     backstory=(
-        "You are a communications specialist working in "
-        "a telecom AI Operations Center. You receive "
-        "verified findings from specialist systems such "
-        "as policy retrieval, network analytics, network "
-        "diagnostics, and billing resolution. Your job is "
-        "to communicate those findings clearly to the "
-        "customer. You never invent operational facts, "
-        "policies, diagnoses, promises, actions, or "
-        "timelines that are not contained in the supplied "
-        "specialist context."
+        "You write customer replies for a telecom operations team. "
+        "You receive verified findings from policy retrieval, network "
+        "analytics, network diagnostics and billing resolution "
+        "systems, and you explain them clearly to the customer. You "
+        "never invent operational facts, policies, diagnoses, "
+        "promises, actions or timelines that are not contained in the "
+        "supplied findings."
     ),
-
     llm=llm,
-
     verbose=False,
-
     allow_delegation=False,
 )
 
 
+# Agent 2: checks the draft and removes anything unsupported
 quality_reviewer = Agent(
     role="Quality Reviewer",
-
     goal=(
-        "Review customer communications for factual "
-        "accuracy, grounding, clarity, policy safety, "
-        "billing safety, and professional tone."
+        "Review customer replies for factual accuracy, grounding, "
+        "clarity, policy safety, billing safety and professional tone."
     ),
-
     backstory=(
-        "You are the final quality reviewer for a telecom "
-        "AI Operations Center. You verify every statement "
-        "against the supplied specialist context before "
-        "the response reaches the customer. You remove "
-        "unsupported assumptions, promises, operational "
-        "judgments, diagnoses, and invented next steps. "
-        "You preserve verified facts exactly and return "
-        "only the final customer-ready response."
+        "You are the last check before a reply reaches the customer. "
+        "You verify every statement against the supplied findings, "
+        "remove unsupported assumptions, promises, judgments, "
+        "diagnoses and invented next steps, keep verified facts "
+        "exactly as they are, and return only the final reply."
     ),
-
     llm=llm,
-
     verbose=False,
-
     allow_delegation=False,
 )
 
 
-def run_customer_comms(
-    query: str,
-    agent_context: str,
-) -> str:
+def run_customer_comms(query: str, agent_context: str) -> str:
+    """Drafts and reviews the customer reply, returning the final text."""
+
+    # Basic input checks
     if not query or not query.strip():
         return (
             "Unable to prepare a customer response "
@@ -108,6 +93,7 @@ def run_customer_comms(
             "was provided."
         )
 
+    # Task 1: write the draft
     draft_task = Task(
         description="""
 Prepare a professional customer-facing response using
@@ -214,17 +200,15 @@ Follow these rules strictly:
 
 Produce a polished draft response for the customer.
 """,
-
         expected_output=(
             "A factual, grounded, professional "
             "customer-facing response based only on the "
             "provided specialist context."
         ),
-
         agent=communications_specialist,
     )
 
-
+    # Task 2: review the draft and strip anything unsupported
     review_task = Task(
         description="""
 Review the drafted customer response against BOTH the
@@ -342,47 +326,32 @@ Do not include:
 - internal reasoning
 - statements such as "the response has been reviewed"
 """,
-
         expected_output=(
             "Only the final factual and customer-ready "
             "response, with all unsupported claims "
             "removed."
         ),
-
         agent=quality_reviewer,
-
-        context=[
-            draft_task
-        ],
+        context=[draft_task],
     )
 
-
+    # The two tasks run one after the other: draft first, then review
     crew = Crew(
-        agents=[
-            communications_specialist,
-            quality_reviewer,
-        ],
-
-        tasks=[
-            draft_task,
-            review_task,
-        ],
-
+        agents=[communications_specialist, quality_reviewer],
+        tasks=[draft_task, review_task],
         process=Process.sequential,
-
         verbose=False,
     )
-
 
     try:
         result = crew.kickoff(
             inputs={
                 "query": query.strip(),
-                "agent_context":
-                    agent_context.strip(),
+                "agent_context": agent_context.strip(),
             }
         )
 
+        # Newer CrewAI versions return an object with a .raw text field
         if hasattr(result, "raw"):
             final_response = result.raw
         else:
@@ -399,6 +368,5 @@ Do not include:
     except Exception as error:
         return (
             "Customer communications could not be "
-            "completed. "
-            f"{type(error).__name__}: {error}"
+            f"completed. {type(error).__name__}: {error}"
         )

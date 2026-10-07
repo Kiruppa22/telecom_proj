@@ -7,19 +7,13 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 
-from llamaindex_rag.policy_rag_worker import (
-    ask_policy_question,
-)
-from llamaindex_rag.sql_semantic_search import (
-    ask_network_analytics,
-)
+from llamaindex_rag.policy_rag_worker import ask_policy_question
+from llamaindex_rag.sql_semantic_search import ask_network_analytics
 from orchestration.adk_remote_client import (
     ask_billing_resolution,
     ask_network_diagnostics,
 )
-from orchestration.crew_nodes import (
-    run_customer_comms,
-)
+from orchestration.crew_nodes import run_customer_comms
 from orchestration.state import AgentState
 
 
@@ -27,22 +21,25 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
 ANTHROPIC_MODEL = os.getenv(
     "ANTHROPIC_MODEL",
     "claude-haiku-4-5-20251001",
 )
 
 if not ANTHROPIC_API_KEY:
-    raise ValueError(
-        "ANTHROPIC_API_KEY was not found in .env"
-    )
+    raise ValueError("ANTHROPIC_API_KEY was not found in .env")
 
-anthropic_client = Anthropic(
-    api_key=ANTHROPIC_API_KEY
-)
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Settings for the supervisor's routing call
+SUPERVISOR_MAX_TOKENS = 100
+SUPERVISOR_TEMPERATURE = 0
+
+# Safety limit so a routing mistake can never loop forever
+RECURSION_LIMIT = 20
 
 
+# Internal worker name -> name shown in the UI and execution trace
 WORKER_DISPLAY_NAMES = {
     "policy_rag": "PolicyRAG",
     "network_analytics": "NetworkAnalytics",
@@ -51,7 +48,7 @@ WORKER_DISPLAY_NAMES = {
     "customer_comms_crew": "CustomerCommsCrew",
 }
 
-
+# Workers that gather facts (the comms crew is always the final step)
 SPECIALIST_WORKERS = {
     "policy_rag",
     "network_analytics",
@@ -60,15 +57,13 @@ SPECIALIST_WORKERS = {
 }
 
 
-def append_context(
-    existing_context: str,
-    worker_name: str,
-    output: str,
-) -> str:
-    section = (
-        f"\n\n--- {worker_name} ---\n"
-        f"{output.strip()}"
-    )
+# ---------------------------------------------------------------
+# Helper functions for the shared state
+# ---------------------------------------------------------------
+
+def append_context(existing_context: str, worker_name: str, output: str) -> str:
+    """Adds a worker's output to the shared context as a labeled section."""
+    section = f"\n\n--- {worker_name} ---\n{output.strip()}"
 
     if not existing_context:
         return section.strip()
@@ -81,27 +76,15 @@ def append_trace(
     worker_name: str,
     output: str,
 ) -> list[dict[str, str]]:
-    trace = list(
-        state.get("execution_trace", [])
-    )
-
-    trace.append(
-        {
-            "worker": worker_name,
-            "output": output.strip(),
-        }
-    )
-
+    """Returns the execution trace with one more step added."""
+    trace = list(state.get("execution_trace", []))
+    trace.append({"worker": worker_name, "output": output.strip()})
     return trace
 
 
-def add_completed_worker(
-    state: AgentState,
-    worker: str,
-) -> list[str]:
-    completed = list(
-        state.get("completed_workers", [])
-    )
+def add_completed_worker(state: AgentState, worker: str) -> list[str]:
+    """Returns the completed-workers list with this worker included once."""
+    completed = list(state.get("completed_workers", []))
 
     if worker not in completed:
         completed.append(worker)
@@ -109,51 +92,49 @@ def add_completed_worker(
     return completed
 
 
+def build_worker_update(state: AgentState, worker: str, output: str) -> dict:
+    """Builds the state update returned by every specialist worker."""
+    display_name = WORKER_DISPLAY_NAMES[worker]
+
+    return {
+        "messages": [f"{display_name}: {output}"],
+        "agent_context": append_context(
+            state.get("agent_context", ""),
+            display_name,
+            output,
+        ),
+        "completed_workers": add_completed_worker(state, worker),
+        "execution_trace": append_trace(state, display_name, output),
+    }
+
+
 def extract_json_object(text: str) -> dict:
+    """Pulls a JSON object out of the model's reply (handles ``` fences)."""
     cleaned = text.strip()
 
     if cleaned.startswith("```"):
-        cleaned = cleaned.replace(
-            "```json",
-            "",
-            1,
-        )
-        cleaned = cleaned.replace(
-            "```",
-            "",
-        )
+        cleaned = cleaned.replace("```json", "", 1)
+        cleaned = cleaned.replace("```", "")
         cleaned = cleaned.strip()
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
 
     if start == -1 or end == -1:
-        raise ValueError(
-            "Supervisor did not return a JSON object."
-        )
+        raise ValueError("Supervisor did not return a JSON object.")
 
-    return json.loads(
-        cleaned[start:end + 1]
-    )
+    return json.loads(cleaned[start:end + 1])
 
 
-def call_supervisor_llm(
-    state: AgentState,
-) -> str:
-    user_query = state.get(
-        "user_query",
-        "",
-    )
+# ---------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------
 
-    completed = state.get(
-        "completed_workers",
-        [],
-    )
-
-    context = state.get(
-        "agent_context",
-        "",
-    )
+def call_supervisor_llm(state: AgentState) -> str:
+    """Asks the LLM which worker should run next and returns its name."""
+    user_query = state.get("user_query", "")
+    completed = state.get("completed_workers", [])
+    context = state.get("agent_context", "")
 
     prompt = f"""
 You are the Supervisor for a telecom AI Operations
@@ -265,14 +246,9 @@ customer_comms_crew
 
     response = anthropic_client.messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=100,
-        temperature=0,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        max_tokens=SUPERVISOR_MAX_TOKENS,
+        temperature=SUPERVISOR_TEMPERATURE,
+        messages=[{"role": "user", "content": prompt}],
     )
 
     text_parts = [
@@ -281,296 +257,133 @@ customer_comms_crew
         if getattr(block, "type", None) == "text"
     ]
 
-    response_text = "\n".join(
-        text_parts
-    ).strip()
-
-    data = extract_json_object(
-        response_text
-    )
-
+    response_text = "\n".join(text_parts).strip()
+    data = extract_json_object(response_text)
     next_worker = data.get("next")
 
-    allowed = SPECIALIST_WORKERS | {
-        "customer_comms_crew"
-    }
+    allowed = SPECIALIST_WORKERS | {"customer_comms_crew"}
 
     if next_worker not in allowed:
         raise ValueError(
-            "Supervisor selected an invalid worker: "
-            f"{next_worker}"
+            f"Supervisor selected an invalid worker: {next_worker}"
         )
 
     return next_worker
 
 
-def supervisor_node(
-    state: AgentState,
-) -> dict:
+def supervisor_node(state: AgentState) -> dict:
+    """Graph node: decides the next worker, with safe fallbacks."""
     try:
-        next_worker = call_supervisor_llm(
-            state
-        )
+        next_worker = call_supervisor_llm(state)
+        completed = state.get("completed_workers", [])
 
-        completed = state.get(
-            "completed_workers",
-            [],
-        )
+        # Guard: never run the same specialist twice
+        if next_worker in completed and next_worker != "customer_comms_crew":
+            next_worker = "customer_comms_crew"
 
-        if (
-            next_worker in completed
-            and next_worker
-            != "customer_comms_crew"
-        ):
-            next_worker = (
-                "customer_comms_crew"
-            )
-
-        return {
-            "next": next_worker,
-        }
+        return {"next": next_worker}
 
     except Exception as error:
+        # If routing fails, go straight to the final reply and record why
         error_message = (
-            "Supervisor routing failed: "
-            f"{type(error).__name__}: {error}"
+            f"Supervisor routing failed: {type(error).__name__}: {error}"
         )
 
         return {
             "next": "customer_comms_crew",
             "error": error_message,
             "agent_context": append_context(
-                state.get(
-                    "agent_context",
-                    "",
-                ),
+                state.get("agent_context", ""),
                 "Supervisor Error",
                 error_message,
             ),
         }
 
 
-def policy_rag_node(
-    state: AgentState,
-) -> dict:
-    worker = "policy_rag"
-    display_name = (
-        WORKER_DISPLAY_NAMES[worker]
-    )
+# ---------------------------------------------------------------
+# Specialist worker nodes
+# ---------------------------------------------------------------
 
+def policy_rag_node(state: AgentState) -> dict:
+    """Answers policy, SLA and FAQ questions from the policy documents."""
     try:
-        result = ask_policy_question(
-            state["user_query"]
-        )
+        result = ask_policy_question(state["user_query"])
 
         if isinstance(result, dict):
-            output = str(
-                result.get(
-                    "answer",
-                    result,
-                )
-            )
+            output = str(result.get("answer", result))
         else:
             output = str(result)
 
     except Exception as error:
-        output = (
-            "Policy RAG failed: "
-            f"{type(error).__name__}: {error}"
-        )
+        output = f"Policy RAG failed: {type(error).__name__}: {error}"
 
-    return {
-        "messages": [
-            f"{display_name}: {output}"
-        ],
-        "agent_context": append_context(
-            state.get(
-                "agent_context",
-                "",
-            ),
-            display_name,
-            output,
-        ),
-        "completed_workers":
-            add_completed_worker(
-                state,
-                worker,
-            ),
-        "execution_trace": append_trace(
-            state,
-            display_name,
-            output,
-        ),
-    }
+    return build_worker_update(state, "policy_rag", output)
 
 
-def network_analytics_node(
-    state: AgentState,
-) -> dict:
-    worker = "network_analytics"
-    display_name = (
-        WORKER_DISPLAY_NAMES[worker]
-    )
-
+def network_analytics_node(state: AgentState) -> dict:
+    """Answers aggregate network questions by querying the database."""
     try:
-        output = str(
-            ask_network_analytics(
-                state["user_query"]
-            )
-        )
+        output = str(ask_network_analytics(state["user_query"]))
 
     except Exception as error:
         output = (
-            "Network analytics failed: "
-            f"{type(error).__name__}: {error}"
+            f"Network analytics failed: {type(error).__name__}: {error}"
         )
 
-    return {
-        "messages": [
-            f"{display_name}: {output}"
-        ],
-        "agent_context": append_context(
-            state.get(
-                "agent_context",
-                "",
-            ),
-            display_name,
-            output,
-        ),
-        "completed_workers":
-            add_completed_worker(
-                state,
-                worker,
-            ),
-        "execution_trace": append_trace(
-            state,
-            display_name,
-            output,
-        ),
-    }
+    return build_worker_update(state, "network_analytics", output)
 
 
-def network_diagnostics_node(
-    state: AgentState,
-) -> dict:
-    worker = "network_diagnostics_adk"
-    display_name = (
-        WORKER_DISPLAY_NAMES[worker]
-    )
-
+def network_diagnostics_node(state: AgentState) -> dict:
+    """Calls the remote network diagnostics agent (A2A, port 8001)."""
     try:
-        result = ask_network_diagnostics(
-            state["user_query"]
-        )
+        result = ask_network_diagnostics(state["user_query"])
 
         if result.get("success"):
             output = result["response"]
         else:
             output = (
-                "Network Diagnostics service "
-                "could not complete the request. "
-                f"{result.get('error')}"
+                "Network Diagnostics service could not complete the "
+                f"request. {result.get('error')}"
             )
 
     except Exception as error:
         output = (
-            "Network Diagnostics failed: "
-            f"{type(error).__name__}: {error}"
+            f"Network Diagnostics failed: {type(error).__name__}: {error}"
         )
 
-    return {
-        "messages": [
-            f"{display_name}: {output}"
-        ],
-        "agent_context": append_context(
-            state.get(
-                "agent_context",
-                "",
-            ),
-            display_name,
-            output,
-        ),
-        "completed_workers":
-            add_completed_worker(
-                state,
-                worker,
-            ),
-        "execution_trace": append_trace(
-            state,
-            display_name,
-            output,
-        ),
-    }
+    return build_worker_update(state, "network_diagnostics_adk", output)
 
 
-def billing_resolution_node(
-    state: AgentState,
-) -> dict:
-    worker = "billing_resolution_adk"
-    display_name = (
-        WORKER_DISPLAY_NAMES[worker]
-    )
-
+def billing_resolution_node(state: AgentState) -> dict:
+    """Calls the remote billing resolution agent (A2A, port 8002)."""
     try:
-        result = ask_billing_resolution(
-            state["user_query"]
-        )
+        result = ask_billing_resolution(state["user_query"])
 
         if result.get("success"):
             output = result["response"]
         else:
             output = (
-                "Billing Resolution service "
-                "could not complete the request. "
-                f"{result.get('error')}"
+                "Billing Resolution service could not complete the "
+                f"request. {result.get('error')}"
             )
 
     except Exception as error:
         output = (
-            "Billing Resolution failed: "
-            f"{type(error).__name__}: {error}"
+            f"Billing Resolution failed: {type(error).__name__}: {error}"
         )
 
-    return {
-        "messages": [
-            f"{display_name}: {output}"
-        ],
-        "agent_context": append_context(
-            state.get(
-                "agent_context",
-                "",
-            ),
-            display_name,
-            output,
-        ),
-        "completed_workers":
-            add_completed_worker(
-                state,
-                worker,
-            ),
-        "execution_trace": append_trace(
-            state,
-            display_name,
-            output,
-        ),
-    }
+    return build_worker_update(state, "billing_resolution_adk", output)
 
 
-def customer_comms_node(
-    state: AgentState,
-) -> dict:
+def customer_comms_node(state: AgentState) -> dict:
+    """Final step: turns the gathered findings into the customer reply."""
     worker = "customer_comms_crew"
-    display_name = (
-        WORKER_DISPLAY_NAMES[worker]
-    )
+    display_name = WORKER_DISPLAY_NAMES[worker]
 
     try:
         output = run_customer_comms(
             state["user_query"],
-            state.get(
-                "agent_context",
-                "",
-            ),
+            state.get("agent_context", ""),
         )
 
     except Exception as error:
@@ -580,20 +393,10 @@ def customer_comms_node(
         )
 
     return {
-        "messages": [
-            f"{display_name}: {output}"
-        ],
+        "messages": [f"{display_name}: {output}"],
         "final_response": output,
-        "completed_workers":
-            add_completed_worker(
-                state,
-                worker,
-            ),
-        "execution_trace": append_trace(
-            state,
-            display_name,
-            output,
-        ),
+        "completed_workers": add_completed_worker(state, worker),
+        "execution_trace": append_trace(state, display_name, output),
     }
 
 
@@ -606,104 +409,53 @@ def route_from_supervisor(
     "billing_resolution_adk",
     "customer_comms_crew",
 ]:
+    """Tells LangGraph which node to run after the supervisor."""
     return state["next"]
 
 
-builder = StateGraph(
-    AgentState
-)
+# ---------------------------------------------------------------
+# Build the graph
+# ---------------------------------------------------------------
 
-builder.add_node(
-    "supervisor",
-    supervisor_node,
-)
+builder = StateGraph(AgentState)
 
-builder.add_node(
-    "policy_rag",
-    policy_rag_node,
-)
+builder.add_node("supervisor", supervisor_node)
+builder.add_node("policy_rag", policy_rag_node)
+builder.add_node("network_analytics", network_analytics_node)
+builder.add_node("network_diagnostics_adk", network_diagnostics_node)
+builder.add_node("billing_resolution_adk", billing_resolution_node)
+builder.add_node("customer_comms_crew", customer_comms_node)
 
-builder.add_node(
-    "network_analytics",
-    network_analytics_node,
-)
+# Every request starts at the supervisor
+builder.add_edge(START, "supervisor")
 
-builder.add_node(
-    "network_diagnostics_adk",
-    network_diagnostics_node,
-)
-
-builder.add_node(
-    "billing_resolution_adk",
-    billing_resolution_node,
-)
-
-builder.add_node(
-    "customer_comms_crew",
-    customer_comms_node,
-)
-
-
-builder.add_edge(
-    START,
-    "supervisor",
-)
-
-
+# The supervisor chooses which worker runs next
 builder.add_conditional_edges(
     "supervisor",
     route_from_supervisor,
     {
-        "policy_rag":
-            "policy_rag",
-
-        "network_analytics":
-            "network_analytics",
-
-        "network_diagnostics_adk":
-            "network_diagnostics_adk",
-
-        "billing_resolution_adk":
-            "billing_resolution_adk",
-
-        "customer_comms_crew":
-            "customer_comms_crew",
+        "policy_rag": "policy_rag",
+        "network_analytics": "network_analytics",
+        "network_diagnostics_adk": "network_diagnostics_adk",
+        "billing_resolution_adk": "billing_resolution_adk",
+        "customer_comms_crew": "customer_comms_crew",
     },
 )
 
+# After each specialist finishes, control returns to the supervisor
+builder.add_edge("policy_rag", "supervisor")
+builder.add_edge("network_analytics", "supervisor")
+builder.add_edge("network_diagnostics_adk", "supervisor")
+builder.add_edge("billing_resolution_adk", "supervisor")
 
-builder.add_edge(
-    "policy_rag",
-    "supervisor",
-)
-
-builder.add_edge(
-    "network_analytics",
-    "supervisor",
-)
-
-builder.add_edge(
-    "network_diagnostics_adk",
-    "supervisor",
-)
-
-builder.add_edge(
-    "billing_resolution_adk",
-    "supervisor",
-)
-
-builder.add_edge(
-    "customer_comms_crew",
-    END,
-)
-
+# The communications crew is always the last step
+builder.add_edge("customer_comms_crew", END)
 
 graph = builder.compile()
 
 
-def run_ai_operations_center(
-    user_query: str,
-) -> dict:
+def run_ai_operations_center(user_query: str) -> dict:
+    """Runs the full workflow for one inquiry and returns the results."""
     initial_state: AgentState = {
         "messages": [],
         "next": "",
@@ -717,30 +469,13 @@ def run_ai_operations_center(
 
     result = graph.invoke(
         initial_state,
-        config={
-            "recursion_limit": 20,
-        },
+        config={"recursion_limit": RECURSION_LIMIT},
     )
 
     return {
-        "final_response": result.get(
-            "final_response",
-            "",
-        ),
-        "execution_trace": result.get(
-            "execution_trace",
-            [],
-        ),
-        "agent_context": result.get(
-            "agent_context",
-            "",
-        ),
-        "completed_workers": result.get(
-            "completed_workers",
-            [],
-        ),
-        "error": result.get(
-            "error",
-            "",
-        ),
+        "final_response": result.get("final_response", ""),
+        "execution_trace": result.get("execution_trace", []),
+        "agent_context": result.get("agent_context", ""),
+        "completed_workers": result.get("completed_workers", []),
+        "error": result.get("error", ""),
     }
