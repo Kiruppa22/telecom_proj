@@ -1,0 +1,13 @@
+.venv/
+.env
+
+__pycache__/
+*.pyc
+*.pyo
+
+data/vector_index/
+
+.vscode/
+.DS_Store
+
+data/telecom_ops.db
